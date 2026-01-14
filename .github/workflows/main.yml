@@ -9,19 +9,32 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Install Arduino CLI
         run: |
-          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          echo "$HOME/bin" >> $GITHUB_PATH
+          wget https://github.com/arduino/arduino-cli/releases/latest/download/arduino-cli_linux_amd64.tar.gz
+          tar -xzf arduino-cli_linux_amd64.tar.gz
+          sudo mv arduino-cli /usr/local/bin/
+          arduino-cli version
 
-      - name: Configure Arduino CLI
+      - name: Setup Arduino core for BW16
         run: |
           arduino-cli config init
-          arduino-cli config set board_manager.additional_urls https://github.com/ambiot/ambd_arduino/raw/master/package_realtek_amebad_index.json
-
-      - name: Install BW16 core
-        run: |
+          arduino-cli config set board_manager.additional_urls \
+            https://github.com/ambiot/ambd_arduino/raw/master/package_realtek_amebad_index.json
           arduino-cli core update-index
+          arduino-cli core install realtek:amebad
+
+      - name: Compile BW16 firmware
+        run: |
+          arduino-cli compile \
+            --fqbn realtek:amebad:BW16 \
+            .
+
+      - name: Upload BIN
+        uses: actions/upload-artifact@v4
+        with:
+          name: BW16_BIN
+          path: build/**/**/*.bin
