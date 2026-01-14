@@ -11,19 +11,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
           sudo apt update
-          sudo apt install -y gcc-arm-none-eabi make curl
+          sudo apt install -y gcc-arm-none-eabi make curl tar xz-utils git
 
-      - name: Download SDK
+      - name: Download AmebaD SDK
         run: |
           curl -L https://github.com/ambiot/ambd_sdk/archive/refs/heads/master.tar.gz -o sdk.tar.gz
           tar -xzf sdk.tar.gz
           mv ambd_sdk-master sdk
 
-      - name: Debug SDK
+      - name: Build LP (KM0) project
         run: |
-          cd sdk
-          ls
-          ls project || true
+          cd sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp
+          make all -j$(nproc)
+
+      - name: Build HP (KM4) project
+        run: |
+          cd sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp
+          make all -j$(nproc)
+
+      - name: Check built images
+        run: |
+          ls -la sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image/
+          ls -la sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/
+
+      # Optional: Upload artifacts nếu muốn tải về bin files
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bw16-firmware
+          path: |
+            sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image/*.bin
+            sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/*.bin
