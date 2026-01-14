@@ -2,39 +2,33 @@ name: Build BW16 Firmware
 
 on:
   push:
-  pull_request:
+    branches: [ "main" ]
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Arduino CLI
-        run: |
-          wget https://github.com/arduino/arduino-cli/releases/latest/download/arduino-cli_linux_amd64.tar.gz
-          tar -xzf arduino-cli_linux_amd64.tar.gz
-          sudo mv arduino-cli /usr/local/bin/
-          arduino-cli version
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
 
-      - name: Setup Arduino core for BW16
+      - name: Install core
         run: |
-          arduino-cli config init
-          arduino-cli config set board_manager.additional_urls \
-            https://github.com/ambiot/ambd_arduino/raw/master/package_realtek_amebad_index.json
           arduino-cli core update-index
-          arduino-cli core install realtek:amebad
+          arduino-cli core install arduino:mbed
 
-      - name: Compile BW16 firmware
+      - name: Compile
         run: |
-          arduino-cli compile \
-            --fqbn realtek:amebad:BW16 \
-            .
+          arduino-cli compile --fqbn arduino:mbed:rtl8720dn bw16v1.ino
 
       - name: Upload BIN
         uses: actions/upload-artifact@v4
+        with:
+          name: BW16_BIN
+          path: build/**/*        uses: actions/upload-artifact@v4
         with:
           name: BW16_BIN
           path: build/**/**/*.bin        uses: actions/upload-artifact@v4
