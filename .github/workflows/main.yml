@@ -44,4 +44,14 @@ jobs:
           name: bw16-firmware
           path: |
             sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image/*.bin
+            sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/*.bin          ls -la sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image/
+          ls -la sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/
+
+      # Optional: Upload artifacts nếu muốn tải về bin files
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bw16-firmware
+          path: |
+            sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_lp/asdk/image/*.bin
             sdk/project/realtek_amebaD_va0_example/GCC-RELEASE/project_hp/asdk/image/*.bin
