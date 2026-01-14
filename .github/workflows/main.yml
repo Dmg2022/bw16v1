@@ -9,26 +9,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Install tools
         run: |
           sudo apt update
           sudo apt install -y gcc-arm-none-eabi make curl
 
-      - name: Download Ameba SDK
+      - name: Download SDK
         run: |
           curl -L https://github.com/ambiot/ambd_sdk/archive/refs/heads/master.tar.gz -o sdk.tar.gz
           tar -xzf sdk.tar.gz
           mv ambd_sdk-master sdk
 
-      - name: Verify SDK
-        run: |
-          ls -la sdk
-          ls sdk/project || true
-
-      - name: Dummy build (no fail)
+      - name: Debug SDK
         run: |
           cd sdk
-          echo "SDK ready"
+          ls
+          ls project || true
